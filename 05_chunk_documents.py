@@ -28,6 +28,33 @@ import json
 import sys
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# Self-contained copy of the doubled-character corruption detector from
+# 02_extract_pdf.py (used there to strip garbled headers, used here to
+# avoid splitting already-garbled segments -- see split_merged_subsections).
+# Kept as a local copy rather than cross-importing a numbered filename,
+# which would be a fragile, unusual dependency between scripts.
+_DOUBLED_CHAR_PATTERN = re.compile(r"([A-Za-z])\1{1,}")
+
+
+def is_garbled_text(segment, max_rate=0.08, min_len=20):
+    """
+    Rate-based corruption check: counts doubled-letter occurrences PER
+    CHARACTER, not as a raw count. A raw count threshold works fine for
+    short single lines (where we know roughly how long a header line is),
+    but doesn't generalize to longer multi-line segments -- a long,
+    completely clean financial table can easily accumulate several
+    incidental double letters across words like "Statement", "Total",
+    "Loss", purely from its length, and a fixed count would wrongly flag
+    it as corrupted. Measured on real examples from these reports:
+    genuinely clean multi-line text scores well under 1% (0.008), while
+    truly garbled text (Telstra's rendering defect) scores 25%+ (0.26).
+    A max_rate of 0.08 gives a comfortable margin between the two.
+    """
+    if not segment or len(segment) < min_len:
+        return False
+    matches = len(_DOUBLED_CHAR_PATTERN.findall(segment))
+    return (matches / len(segment)) >= max_rate
+
 TARGET_CHUNK_TOKENS = 600
 CHUNK_OVERLAP_TOKENS = 100
 # Rough chars-per-token approximation for English text (~4 chars/token);
@@ -83,11 +110,82 @@ def is_table_segment(segment, min_lines=2, numeric_line_ratio=0.4, max_fragment_
     return True
 
 
+_SUBSECTION_HEADER_PATTERN = re.compile(r"^\d+\.\d+\.\d+\s+[A-Z]", re.MULTILINE)
+
+
+def split_merged_subsections(segment, min_sections=2):
+    """
+    Some table segments span multiple distinct numbered sub-notes that
+    happen to sit on the same page with no blank line between them (e.g.
+    "2.3.1 Branch and administration expenses", "2.3.2 Employee benefits
+    expense", "2.3.3 Depreciation and amortisation expense" all running
+    consecutively). Treating these as one unsplittable table chunk dilutes
+    each sub-note's content with the other two, hurting retrieval
+    precision for a query about just one of them (e.g. "employee benefits
+    expense" competing for relevance against two unrelated expense notes
+    in the same chunk).
+
+    If a segment contains 2+ lines matching a "N.N.N Title" sub-section
+    header pattern, split it into separate pieces at those boundaries so
+    each sub-note becomes its own (still unsplit-internally) chunk. If
+    there's only 0-1 such header (the normal case -- a chunk legitimately
+    starting with its own single section header), leave it as one segment.
+
+    Guard: some PDFs (e.g. Telstra's table-of-contents pages) have a
+    character-rendering defect that doubles letters throughout the WHOLE
+    segment, not just a header line. A garbled segment can coincidentally
+    contain digit patterns that look like "N.N.N" section numbers (e.g.
+    from mangled page-reference numbers in a contents listing). Splitting
+    already-garbled text just produces more small garbled fragments
+    instead of one larger one -- no information is gained, so we skip
+    splitting entirely when the segment looks corrupted.
+    """
+    if is_garbled_text(segment):
+        return [segment]
+
+    matches = list(_SUBSECTION_HEADER_PATTERN.finditer(segment))
+    if len(matches) < min_sections:
+        return [segment]
+
+    pieces = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(segment)
+        piece = segment[start:end].strip()
+        if piece:
+            pieces.append(piece)
+
+    # Anything before the first detected header (rare, but possible if the
+    # segment has introductory text before the first numbered sub-note)
+    # gets prepended to the first piece rather than dropped.
+    leading = segment[:matches[0].start()].strip()
+    if leading and pieces:
+        pieces[0] = leading + "\n" + pieces[0]
+
+    if not pieces:
+        return [segment]
+
+    # Whole-segment garbling can be diluted below threshold when a large
+    # mixed segment has both clean and corrupted sections averaged
+    # together (confirmed on a real Telstra page). Check each individual
+    # piece too -- splitting can isolate a smaller, more concentrated
+    # corrupted fragment that the whole-segment average missed. If any
+    # piece looks garbled, the split isn't trustworthy here, so fall back
+    # to the single whole segment rather than emit a mix of good and
+    # garbled small chunks.
+    if any(is_garbled_text(p, min_len=10) for p in pieces):
+        return [segment]
+
+    return pieces
+
+
 def split_into_segments(page_text):
     """
     Split a page's combined text into a list of (segment_text, is_table)
     tuples. Segments are separated by blank lines, which is how
     02_extract_pdf.py joins narrative text and table blocks together.
+    Table-like segments are additionally checked for merged sub-sections
+    (see split_merged_subsections) and broken apart if needed.
     """
     raw_segments = re.split(r"\n\s*\n", page_text)
     segments = []
@@ -95,7 +193,11 @@ def split_into_segments(page_text):
         seg = seg.strip()
         if not seg:
             continue
-        segments.append((seg, is_table_segment(seg)))
+        if is_table_segment(seg):
+            for piece in split_merged_subsections(seg):
+                segments.append((piece, True))
+        else:
+            segments.append((seg, False))
     return segments
 
 
@@ -148,11 +250,30 @@ def chunk_extracted_file(filepath):
 
     for doc in page_docs:
         page_chunks = chunk_page_document(doc, splitter)
+        company = doc["metadata"]["company"]
         for pc in page_chunks:
             chunk_counter += 1
+            # Many individual financial-statement notes never mention the
+            # company name in their own text (e.g. a note titled "Employee
+            # benefits expense" just lists figures, with "Woolworths" only
+            # appearing on page headers elsewhere that got stripped during
+            # extraction). Since only embedded TEXT is compared for
+            # similarity -- metadata like company is not used by the
+            # embedding model -- a query that includes the company name
+            # (a very common, natural way to ask) can fail to retrieve the
+            # right chunk purely because the company name isn't present in
+            # it to match against. We fix this generally for every chunk,
+            # in every company's report, by prepending the company name to
+            # a SEPARATE embedding_text field used only for generating the
+            # embedding vector. The original "text" field (shown to users,
+            # used for citations and for the LLM's context) stays exactly
+            # as extracted, so this doesn't change what the person sees.
+            embedding_text = f"{company}: {pc['text']}"
+
             all_chunks.append({
-                "chunk_id": f"{doc['metadata']['company'].lower()}_{chunk_counter:05d}",
+                "chunk_id": f"{company.lower()}_{chunk_counter:05d}",
                 "text": pc["text"],
+                "embedding_text": embedding_text,
                 "is_table": pc["is_table"],
                 "metadata": {
                     **doc["metadata"],

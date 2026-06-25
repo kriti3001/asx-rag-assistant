@@ -2,15 +2,23 @@
 Step 2: Optimised PDF extraction for ASX annual reports.
 
 Handles:
-1. Header/footer stripping (repeated boilerplate lines across pages)
-2. Tables converted to clean Markdown (not raw list-of-lists)
+1. Header/footer stripping (repeated boilerplate lines across pages,
+   plus a fallback for garbled first-line headers caused by a character-
+   rendering defect seen in some PDFs)
+2. Tables converted to readable "label value" text (preserving row
+   structure without forcing a rigid grid, since real financial tables
+   often have merged/irregular multi-line cells)
 3. Tables kept attached to their surrounding narrative text, in page order
 4. Empty/near-empty pages skipped
-5. Metadata tagging (company, source file, page number) on every chunk
+5. Double-wide "two-page-spread" PDFs (seen in some reports) detected and
+   split into separate left/right page units before extraction
+6. Metadata tagging (company, source file, page number, table count) on
+   every page document
 
-Output: a list of "page documents" — one dict per page, each containing
-clean combined text (narrative + markdown tables) and metadata.
-This is the input the chunking step (next file) will consume.
+Output: a list of "page documents" — one dict per page (or per half-page,
+for split spreads), each containing clean combined text (narrative text +
+table text) and metadata. This is the input the chunking step
+(05_chunk_documents.py) consumes.
 """
 
 import os
@@ -115,6 +123,27 @@ def looks_garbled(line, min_hits=4):
     return has_doubled_chars(line, min_hits=min_hits)
 
 
+def is_plausible_page_number(stripped_line, min_year=1990, max_year=2035):
+    """
+    A standalone short digit string could be a genuine page number (safe
+    to strip) OR a fiscal year used as a table column header on its own
+    line (must NOT be stripped). Confirmed directly on BHP's report: its
+    tables show "2025" / "2024" / "2023" each on a separate line before
+    the data rows, and our previous page-number filter was deleting all
+    of them -- removing year context entirely, not just leaving it
+    ambiguous. A page number in any of these ~100-450 page reports will
+    never realistically fall in a plausible fiscal year range, so
+    excluding that range is a safe way to keep stripping real page
+    numbers while preserving year labels.
+    """
+    if not re.fullmatch(r"\d{1,4}", stripped_line):
+        return False
+    value = int(stripped_line)
+    if min_year <= value <= max_year:
+        return False  # looks like a year, not a page number
+    return True
+
+
 def clean_page_text(text, repeated_lines):
     """Remove boilerplate lines and strip standalone page-number lines."""
     if not text:
@@ -128,8 +157,10 @@ def clean_page_text(text, repeated_lines):
             continue
         if stripped in repeated_lines:
             continue
-        # standalone page numbers (just digits, possibly short)
-        if re.fullmatch(r"\d{1,4}", stripped):
+        # standalone page numbers (just digits, possibly short) -- but
+        # NOT standalone years, which must be preserved as table header
+        # context (see is_plausible_page_number).
+        if is_plausible_page_number(stripped):
             continue
         # The first line of a page is the most common place for a running
         # header to appear. If it looks garbled (character-rendering
@@ -164,6 +195,144 @@ def page_has_real_table(page, min_filled_ratio=0.3, min_rows=2):
         total = sum(len(row) for row in t)
         filled = sum(1 for row in t for c in row if c and c.strip())
         if total > 0 and (filled / total) >= min_filled_ratio:
+            return True
+    return False
+
+
+_YEAR_LINE_PATTERN = re.compile(r"^((?:20\d{2}\s*)+)$", re.MULTILINE)
+_NUMBER_PATTERN = re.compile(r"-?[\d,]+\.?\d*")
+
+
+def annotate_year_columns(table_text, max_year_span=3):
+    """
+    Financial-statement tables show fiscal years as column headers, but in
+    several DIFFERENT formats across these reports -- confirmed directly:
+    Woolworths uses two years on one line ("2025 2024"); BHP uses three
+    years on one line ("2025 2024 2023") in some tables and the same
+    three years stacked one-per-line elsewhere. An LLM reading a data row
+    with several numbers (e.g. "Profit after taxation 11,143 9,601
+    14,324") has no reliable way to know which number is which year
+    without this header context -- confirmed in testing, where this
+    caused a wrong-year citation (the LLM picked the prior year's figure
+    instead of the current year's for BHP specifically).
+
+    Rather than match one fixed year-count per pattern (which we tried
+    twice and both times a real report used a different count/layout),
+    this matches ANY line consisting purely of one or more 4-digit years
+    in sequence -- 2, 3, or more -- and annotates it generically. A
+    max_year_span sanity check (the highest and lowest year on the line
+    must be within a few years of each other) avoids misfiring on
+    unrelated multi-year content like a sustainability target table
+    listing "2025 2030", which is not a fiscal-year comparison header.
+    """
+    def replace_line(match):
+        years = match.group(1).split()
+        if len(years) < 2:
+            return match.group(0)
+        if max(int(y) for y in years) - min(int(y) for y in years) > max_year_span:
+            return match.group(0)
+        ordinal_note = ", ".join(
+            f"number {i+1} is for {y}" for i, y in enumerate(years)
+        )
+        return match.group(0) + f"\n[Note: in the data rows below, {ordinal_note}]"
+
+    return _YEAR_LINE_PATTERN.sub(replace_line, table_text)
+
+
+_CANONICAL_PROFIT_PATTERN = re.compile(
+    r"^(Profit(?:/\(loss\))? for the (?:period|year)\b)(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ATTRIBUTABLE_PATTERN = re.compile(
+    r"^(Profit(?:/\(loss\))? (?:for the (?:period|year) )?attributable to\b|"
+    r"^Net profit attributable to\b|"
+    r"^Equity holders of\b)",
+    re.IGNORECASE,
+)
+
+
+def annotate_canonical_profit_line(table_text):
+    """
+    Statutory profit/loss statements consistently show a Group/consolidated
+    TOTAL line (e.g. "Profit for the period 953 117") immediately followed
+    by a BREAKDOWN of that same total split between equity holders and
+    non-controlling interests (e.g. "Profit/(loss) for the period
+    attributable to: Equity holders of the parent entity 963 108").
+
+    Both numbers are genuinely correct, correctly labeled figures for the
+    same period -- this isn't a data error. But a query like "what was
+    the company's profit" is ambiguous between the two, and we confirmed
+    in testing that an LLM can inconsistently pick either one (run to run,
+    even with explicit prompt instructions to be consistent) -- which
+    silently breaks comparability the moment one company's answer uses
+    the total and another's uses the shareholder-attributable figure.
+
+    Rather than rely on probabilistic prompt-level guidance, we resolve
+    this deterministically at the data layer: detect the canonical
+    "Profit for the period/year" line and tag it explicitly as the
+    standard headline figure to report by default, distinguishing it
+    from the immediately-following "...attributable to..." breakdown.
+    This makes the answer the SAME every time, for every company, since
+    it's now a rule rather than a per-query LLM judgment call.
+    """
+    lines = table_text.split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        match = _CANONICAL_PROFIT_PATTERN.match(stripped)
+        # Guard: a genuine table row has a real number after the label
+        # (e.g. "953 117"). Ordinary prose that happens to start with
+        # similar wording (e.g. "Profit for the year ahead looks strong
+        # according to guidance") does not, and must NOT be annotated --
+        # confirmed as a real false-positive via direct testing.
+        has_number_after_label = bool(match) and bool(_NUMBER_PATTERN.search(match.group(2) or ""))
+        if match and has_number_after_label and not _ATTRIBUTABLE_PATTERN.search(stripped):
+            out.append(line)
+            out.append(
+                "[Note: the line above is the company's TOTAL/Group profit figure -- "
+                "this is the standard headline 'net profit' figure to report by default. "
+                "Lines below mentioning 'attributable to equity holders' or 'non-controlling "
+                "interests' are a BREAKDOWN of this same total, not a different total -- "
+                "do not report the attributable-only portion as if it were the company's "
+                "overall net profit unless specifically asked for the shareholder-attributable figure.]"
+            )
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _extract_numbers(text):
+    """Pull out numeric tokens (handles thousands separators, decimals, negatives)."""
+    return [n for n in _NUMBER_PATTERN.findall(text) if any(c.isdigit() for c in n)]
+
+
+def _line_duplicates_table_row(line, table_row_number_sets, min_overlap=2):
+    """
+    Check whether a plain-text line is substantially the same content as
+    a table row already captured in table_blocks, even if exact-string
+    matching would miss it. Confirmed as a real bug: pdfplumber's
+    'text' table-parsing strategy fragments a row like "Profit after
+    taxation 11,143 9,601 14,324" into pieces like "Profit after
+    taxatio" | "n" | "9,601" | "14,324", so individual fragments never
+    exactly match the plain-text line, and the dedup silently failed --
+    leaving the SAME financial figures duplicated in both a clean table
+    chunk and a messy leftover narrative-text chunk. The duplicate
+    chunk lacks our year-column annotation and is missing context, so
+    when it gets retrieved instead of the clean version, an LLM has no
+    way to know which number is which year -- confirmed as the direct
+    cause of a wrong-year citation in testing.
+
+    Numbers are a much more robust signal here than exact text: a real
+    duplicate row shares most of its numeric values with the
+    corresponding table row regardless of how the surrounding label text
+    got fragmented.
+    """
+    line_numbers = set(_extract_numbers(line))
+    if len(line_numbers) < min_overlap:
+        return False
+    for row_numbers in table_row_number_sets:
+        overlap = line_numbers & row_numbers
+        if len(overlap) >= min_overlap:
             return True
     return False
 
@@ -241,25 +410,40 @@ def extract_pdf(filepath, min_chars=20):
     """
     Extract one PDF into a list of page-level documents.
     Each document = {text, metadata} where text combines cleaned narrative
-    text and any tables (as Markdown), and metadata identifies source.
+    text and any tables (as text), and metadata identifies source.
     """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"PDF not found: {filepath}")
+
     company = extract_company_name(filepath)
     page_docs = []
 
-    with pdfplumber.open(filepath) as pdf:
+    try:
+        pdf_context = pdfplumber.open(filepath)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not open '{filepath}' as a PDF. It may be corrupted, "
+            f"password-protected, or not a real PDF file. Original error: {e}"
+        )
+
+    with pdf_context as pdf:
         total_pages = len(pdf.pages)
         page_units = get_page_units(pdf)
         repeated_lines = find_repeated_lines(page_units)
 
         for page, page_label in page_units:
-            # Some PDFs have an overlapping-text-layer bug that doubles
-            # every character; extract_page_text() detects and fixes this
-            # cheaply, only paying the expensive dedupe cost when needed.
+            # extract_page_text() returns plain extract_text() output; the
+            # garbled-header defect some PDFs show (Telstra's) is handled
+            # separately below via clean_page_text()'s first-line check,
+            # not by re-extracting with dedupe_chars (too slow at scale --
+            # see has_doubled_chars()'s docstring for why).
             raw_text = extract_page_text(page)
             cleaned_text = clean_page_text(raw_text, repeated_lines)
 
+            cleaned_lines = cleaned_text.split("\n")
+            cleaned_line_numbers = [set(_extract_numbers(l)) for l in cleaned_lines]
+
             table_blocks = []
-            table_cell_texts = set()
 
             if page_has_real_table(page):
                 # Only re-parse with the text/lines strategy (better at
@@ -272,23 +456,49 @@ def extract_pdf(filepath, min_chars=20):
                 })
                 for t in tables:
                     txt = table_to_text(t)
-                    if txt:
-                        table_blocks.append(txt)
-                        for row in t:
-                            for cell in row:
-                                if cell:
-                                    for piece in cell.strip().split("\n"):
-                                        if piece.strip():
-                                            table_cell_texts.add(piece.strip())
+                    if not txt:
+                        continue
 
-            # pdfplumber's extract_text() picks up table cell content as
-            # plain text too, which would duplicate it alongside the Markdown
-            # version below. Strip lines that are just table cell content
-            # (short lines exactly matching a known cell) to avoid that.
-            if table_cell_texts:
-                lines = cleaned_text.split("\n")
-                lines = [l for l in lines if l.strip() not in table_cell_texts]
-                cleaned_text = "\n".join(lines)
+                    # For each row in this table-parsed version, check
+                    # whether the plain-text extraction already covers it
+                    # AT LEAST as completely. We confirmed a real case
+                    # (BHP page 84) where the table-parsing strategy
+                    # actually produces a WORSE result than plain text --
+                    # a misdetected column boundary orphaned an entire
+                    # year's figures into the header row, leaving the
+                    # "official" table row with fewer numbers than the
+                    # plain-text line covering the same content. Keeping
+                    # BOTH versions as separate chunks doesn't fix this --
+                    # it just lets retrieval gamble on which one it picks,
+                    # and we confirmed the broken one can still win that
+                    # gamble. So instead: if plain text covers this table
+                    # at least as well, suppress the table_blocks version
+                    # entirely rather than emit a worse duplicate chunk.
+                    row_number_sets = []
+                    for row in t:
+                        row_text = " ".join(cell or "" for cell in row)
+                        row_numbers = set(_extract_numbers(row_text))
+                        if row_numbers:
+                            row_number_sets.append(row_numbers)
+
+                    rows_covered_by_plain_text = 0
+                    for row_numbers in row_number_sets:
+                        for line_numbers in cleaned_line_numbers:
+                            overlap = row_numbers & line_numbers
+                            if len(overlap) >= 2 and len(line_numbers) >= len(row_numbers):
+                                rows_covered_by_plain_text += 1
+                                break
+
+                    # If the plain text already covers most of this
+                    # table's real (numeric) rows at least as completely,
+                    # the table-parsed version adds no value and risks
+                    # being the worse copy -- skip it.
+                    if row_number_sets and rows_covered_by_plain_text >= len(row_number_sets) * 0.6:
+                        continue
+
+                    table_blocks.append(txt)
+
+            cleaned_text = "\n".join(cleaned_lines)
 
             # Combine narrative text and tables for this page, in order.
             # Keeping them together (not in separate chunks) preserves the
@@ -300,6 +510,8 @@ def extract_pdf(filepath, min_chars=20):
             combined_parts.extend(table_blocks)
 
             combined_text = "\n\n".join(combined_parts)
+            combined_text = annotate_year_columns(combined_text)
+            combined_text = annotate_canonical_profit_line(combined_text)
 
             # Skip pages with effectively no content (e.g. blank cover/back pages)
             if len(combined_text) < min_chars:

@@ -6,3 +6,4 @@ chroma_db/
 data/
 extracted/
 chunks/
+eval/eval_results.json
